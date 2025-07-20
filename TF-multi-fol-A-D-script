@@ -1,106 +1,184 @@
 #!/bin/bash
+set -euo pipefail
 
-set -e
-
-# Colors
+# Color Definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[1;34m'
-BOLD='\033[1m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Disable ALL Terraform locking
+export TF_CLI_ARGS="-lock=false"
+export TF_CLI_ARGS_init="-lock=false"
+export TF_CLI_ARGS_plan="-lock=false"
+export TF_CLI_ARGS_apply="-lock=false"
+export TF_CLI_ARGS_destroy="-lock=false"
 
-FOLDER_A="consumer-EP"
-FOLDER_B="provider-EPS"
+LAST_PATHS_FILE=".last_tf_paths"
+projects=()
+selected_projects=()
 
-PATH_A="$SCRIPT_DIR/$FOLDER_A"
-PATH_B="$SCRIPT_DIR/$FOLDER_B"
+# 🔍 Better project detection that handles edge cases
+function detect_tf_projects() {
+  echo -e "\n${CYAN}📦 Scanning for Terraform projects...${NC}"
+  projects=()
 
-[[ ! -d "$PATH_A" ]] && { echo -e "${RED}❌ Folder not found: $PATH_A${NC}"; exit 1; }
-[[ ! -d "$PATH_B" ]] && { echo -e "${RED}❌ Folder not found: $PATH_B${NC}"; exit 1; }
+  # Find all valid Terraform directories (including root)
+  while IFS= read -r -d '' dir; do
+    # Verify it's actually a Terraform project (has .tf files)
+    if ls "$dir"/*.tf &>/dev/null || [[ "$dir" == "." && $(ls *.tf 2>/dev/null | wc -l) -gt 0 ]]; then
+      [[ "$dir" == "." ]] && projects+=(".") || projects+=("$dir")
+    fi
+  done < <(find . -mindepth 1 -maxdepth 3 -type f -name "*.tf" -exec dirname {} \; | sort -u | tr '\n' '\0')
 
-# Init with fallback
-terraform_init_with_fallback() {
-  local dir=$1
-  echo -e "${BLUE}👉 Initializing Terraform in >>>>>>>> $dir${NC}"
-  cd "$dir"
-  if ! terraform init -input=false > /dev/null; then
-    echo -e "${YELLOW}⚠️ Init failed, retrying with -upgrade...${NC}"
-    terraform init -input=false -upgrade > /dev/null || {
-      echo -e "${RED}❌ terraform init failed even with -upgrade${NC}"
-      exit 1
-    }
-  fi
-  cd "$SCRIPT_DIR"
-}
-
-# Plan and apply
-terraform_plan_and_apply() {
-  local dir=$1
-  local extra_var=$2
-  echo -e "${YELLOW}💡 Planning Terraform for >>>>>>>> $dir${NC}"
-  cd "$dir"
-  if terraform plan $extra_var; then
-    echo -e "${GREEN}✅ Plan successful — applying...${NC}"
-    terraform apply -auto-approve $extra_var
-  else
-    echo -e "${RED}❌ terraform plan failed. Exiting.${NC}"
+  if [[ ${#projects[@]} -eq 0 ]]; then
+    echo -e "${RED}❌ No valid Terraform projects found (checked current dir and 3 levels deep)${NC}"
     exit 1
   fi
-  cd "$SCRIPT_DIR"
+
+  echo -e "\n${GREEN}📂 Detected Terraform projects:${NC}"
+  for i in "${!projects[@]}"; do
+    printf "${BLUE}%3d.${NC} %s\n" "$((i + 1))" "$([[ "${projects[$i]}" == "." ]] && echo "./" || echo "${projects[$i]}")"
+  done
 }
 
-# Main menu
-echo -e "${BOLD}What do you want to do?${NC}"
-echo "1) Terraform Apply"
-echo "2) Terraform Destroy"
-read -rp "Enter choice (1 or 2): " ACTION
+# 🚀 Robust execution engine with clean one-line output
+function run_terraform() {
+  local path="$1"
+  local action="$2"
+  local display_path="$([[ "$path" == "." ]] && echo "./" || echo "$path")"
+  local output_line="${#selected_projects[@]}. $display_path"
 
-# ---------------------- APPLY ---------------------
-if [[ "$ACTION" == "1" ]]; then
-  echo
-  read -rp "Does consumer-EP need an output from provider-EPS? (type -y to confirm): " CONFIRM
-  [[ "$CONFIRM" != "-y" ]] && { echo -e "${RED}❌ Dependency not confirmed. Exiting.${NC}"; exit 1; }
+  pushd "$path" >/dev/null || { echo -e "${RED}❌ Failed to enter directory${NC}"; return 1; }
 
-  echo -e "${BLUE}🔧 Step 1: Init & Apply provider-EPS${NC}"
-  terraform_init_with_fallback "$PATH_B"
-  terraform_plan_and_apply "$PATH_B"
+  # 1. INIT
+  echo -ne "${output_line} [init..."
+  local start=$(date +%s)
+  if terraform init -input=false -no-color &>/dev/null; then
+    local duration=$(( $(date +%s) - start ))
+    printf " ${GREEN}OK${NC} (%02dm%02ds)]" $((duration/60)) $((duration%60))
+  else
+    local duration=$(( $(date +%s) - start ))
+    printf " ${RED}FAIL${NC} (%02dm%02ds)]" $((duration/60)) $((duration%60))
+    popd >/dev/null
+    return 1
+  fi
 
-  echo -e "${BLUE}🔍 Step 2: Capturing output from provider-EPS...${NC}"
-  cd "$PATH_B"
-  OUTPUT_VALUE=$(terraform output -raw endpoint_service_name)
-  cd "$SCRIPT_DIR"
-  echo -e "${GREEN}✅ Captured endpoint_service_name: $OUTPUT_VALUE${NC}"
+  if [[ "$action" == "destroy" ]]; then
+    # 2a. DESTROY FLOW
+    echo -ne " [check..."
+    start=$(date +%s)
+    local resources=$(terraform state list 2>/dev/null | wc -l)
+    duration=$(( $(date +%s) - start ))
+    printf " ${YELLOW}%d resources${NC} (%02dm%02ds)]" "$resources" $((duration/60)) $((duration%60))
 
-  echo -e "${BLUE}🔧 Step 3: Init & Apply consumer-EP${NC}"
-  terraform_init_with_fallback "$PATH_A"
-  terraform_plan_and_apply "$PATH_A" "-var=endpoint_service_name=$OUTPUT_VALUE"
+    if [[ $resources -eq 0 ]]; then
+      printf " ${YELLOW}SKIPPED${NC}\n"
+      popd >/dev/null
+      return 0
+    fi
 
-  echo -e "${GREEN}${BOLD}🎉 Apply process complete for both modules!${NC}"
+    echo -ne " [destroy..."
+    start=$(date +%s)
+    if terraform destroy -auto-approve -input=false -no-color &>/dev/null; then
+      duration=$(( $(date +%s) - start ))
+      printf " ${GREEN}DONE${NC} (%02dm%02ds)]\n" $((duration/60)) $((duration%60))
+    else
+      duration=$(( $(date +%s) - start ))
+      printf " ${RED}FAIL${NC} (%02dm%02ds)]" $((duration/60)) $((duration%60))
 
-# ---------------------- DESTROY ---------------------
-elif [[ "$ACTION" == "2" ]]; then
-  echo -e "${RED}🔥 Destroying Terraform resources in >>>>>>>> $PATH_A${NC}"
-  cd "$PATH_A"
-  terraform destroy -auto-approve -var=endpoint_service_name="x" || true
-  cd "$SCRIPT_DIR"
+      # Recovery attempt
+      echo -ne " [retry..."
+      start=$(date +%s)
+      terraform force-unlock -force $(terraform state list 2>/dev/null | head -1)
+      if terraform destroy -auto-approve -input=false -no-color &>/dev/null; then
+        duration=$(( $(date +%s) - start ))
+        printf " ${GREEN}DONE${NC} (%02dm%02ds)]\n" $((duration/60)) $((duration%60))
+      else
+        duration=$(( $(date +%s) - start ))
+        printf " ${RED}FAIL${NC} (%02dm%02ds)]\n" $((duration/60)) $((duration%60))
+        popd >/dev/null
+        return 1
+      fi
+    fi
+  else
+    # 2b. APPLY FLOW
+    echo -ne " [plan..."
+    start=$(date +%s)
+    if terraform plan -input=false -no-color -out=tfplan &>/dev/null; then
+      duration=$(( $(date +%s) - start ))
+      printf " ${GREEN}OK${NC} (%02dm%02ds)]" $((duration/60)) $((duration%60))
+    else
+      duration=$(( $(date +%s) - start ))
+      printf " ${RED}FAIL${NC} (%02dm%02ds)]" $((duration/60)) $((duration%60))
+      popd >/dev/null
+      return 1
+    fi
 
-  echo -e "${RED}🔥 Destroying Terraform resources in >>>>>>>> $PATH_B (1st pass)${NC}"
-  cd "$PATH_B"
-  terraform destroy -auto-approve || true
-  cd "$SCRIPT_DIR"
+    echo -ne " [apply..."
+    start=$(date +%s)
+    if terraform apply -input=false -no-color tfplan &>/dev/null; then
+      duration=$(( $(date +%s) - start ))
+      printf " ${GREEN}DONE${NC} (%02dm%02ds)]\n" $((duration/60)) $((duration%60))
+    else
+      duration=$(( $(date +%s) - start ))
+      printf " ${RED}FAIL${NC} (%02dm%02ds)]\n" $((duration/60)) $((duration%60))
+      popd >/dev/null
+      return 1
+    fi
+  fi
 
-  echo -e "${RED}🔥 Final cleanup of >>>>>>>> $PATH_B (2nd pass)${NC}"
-  cd "$PATH_B"
-  terraform destroy -auto-approve || true
-  cd "$SCRIPT_DIR"
+  popd >/dev/null
+  return 0
+}
 
-  echo -e "${GREEN}${BOLD}✅ Destroy process complete for both modules!${NC}"
+# 🌱 Main Execution
+clear
+echo -e "${GREEN}🌱 Terraform Automation Script${NC}"
+echo -e "${BLUE}--------------------------------${NC}"
+echo -e "1. ${CYAN}Apply${NC} (create/modify infrastructure)"
+echo -e "2. ${RED}Destroy${NC} (tear down infrastructure)"
+echo -ne "\n${YELLOW}➡️ Select operation (1-2): ${NC}"
+read -r choice
 
-else
-  echo -e "${RED}❌ Invalid choice. Exiting.${NC}"
-  exit 1
-fi
+case "$choice" in
+  1|2)
+    detect_tf_projects
+    echo -e "\n${YELLOW}🧮 Enter project numbers (e.g., 1 3 5) or 'all': ${NC}"
+    read -r order
 
+    if [[ "$order" == "all" ]]; then
+      selected_projects=("${projects[@]}")
+    else
+      for i in $order; do
+        selected_projects+=("${projects[$((i-1))]}")
+      done
+    fi
+
+    echo -e "\n${CYAN}➡️ Will execute:${NC}"
+    for i in "${!selected_projects[@]}"; do
+      printf "${YELLOW}%3d.${NC} %s\n" "$((i+1))" "$([[ "${selected_projects[$i]}" == "." ]] && echo "./" || echo "${selected_projects[$i]}")"
+    done
+
+    echo -ne "\n${GREEN}✅ Confirm? (y/n): ${NC}"
+    read -r confirm
+    [[ "$confirm" == "y" ]] || { echo -e "${RED}❌ Aborted.${NC}"; exit 1; }
+
+    # Execute all projects
+    for i in "${!selected_projects[@]}"; do
+      path="${selected_projects[$i]}"
+      if ! run_terraform "$path" "$([[ "$choice" == "1" ]] && echo "apply" || echo "destroy")"; then
+        echo -e "\n${RED}⛔ Operation failed on $path${NC}"
+        exit 1
+      fi
+    done
+
+    [[ "$choice" == "1" ]] && printf "%s\n" "${selected_projects[@]}" > "$LAST_PATHS_FILE"
+    ;;
+  *)
+    echo -e "${RED}❌ Invalid choice. Exiting.${NC}"
+    exit 1
+    ;;
+esac
